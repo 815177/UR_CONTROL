@@ -81,7 +81,8 @@ for traj_id in range(int(sys.argv[1]), int(sys.argv[2])):
             "dphi_b_x,dphi_b_y,dphi_b_z,"
             "p_e_x,p_e_y,p_e_z,"
             "dp_e_x,dp_e_y,dp_e_z,"
-            "u_pitch,u_yaw\n"
+            "u_pitch,u_yaw,"
+            "mocap_frame,mocap_age,mocap_valid_e,mocap_valid_b,robot_age\n"
         )
     log_file.write(header)
 
@@ -124,6 +125,8 @@ for traj_id in range(int(sys.argv[1]), int(sys.argv[2])):
         left_new = dloTracker.marker_positions[1, :].clone()
         right_new = dloTracker.marker_positions[0, :].clone()
         orient_new = quat2euler(torch.tensor(ur10_control.q_current, device=device))
+        mocap_state = dloTracker.get_state()                          # edad del dato -> retardo medible offline
+        robot_age = time.perf_counter() - ur10_control.joint_states_t
        
         # unwrap angular difference
         dtheta = orient_new[[0, 2]] - orient_f[[0 ,2]]
@@ -158,7 +161,9 @@ for traj_id in range(int(sys.argv[1]), int(sys.argv[2])):
             f"{orient_vel_f[0].item():.6f},{orient_vel_f[1].item():.6f},{orient_vel_f[2].item():.6f},"
             f"{right_f[0].item():.6f},{right_f[1].item():.6f},{right_f[2].item():.6f},"
             f"{right_vel_f[0].item():.6f},{right_vel_f[1].item():.6f},{right_vel_f[2].item():.6f},"
-            f"{u_pitch_yaw[0].item():.10f},{u_pitch_yaw[1].item():.10f}\n"
+            f"{u_pitch_yaw[0].item():.10f},{u_pitch_yaw[1].item():.10f},"
+            f"{mocap_state['frame_number']},{mocap_state['age']:.4f},"
+            f"{int(mocap_state['valid'][0])},{int(mocap_state['valid'][1])},{robot_age:.4f}\n"
         )
 
         log_file.write(line)

@@ -1,4 +1,5 @@
 # import torch
+import time
 import numpy as np
 import roslibpy
 from core.ur10_core import *
@@ -28,6 +29,7 @@ class UR10Control:
         self.joint_states = np.zeros(6)
         self.T_current = np.eye(4)
         self.q_current = np.zeros(4)
+        self.joint_states_t = float('nan')    # time.perf_counter() del último /joint_states recibido
         self.current_ros_time = {'secs': 0, 'nsecs': 0}
         # self.current_force = np.zeros(3)
         # self.current_torque = np.zeros(3)
@@ -55,6 +57,7 @@ class UR10Control:
         wrist_3_joint  = float(msg['position'][-1])
 
         self.joint_states[:] = [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+        self.joint_states_t = time.perf_counter()
         
         fk_func = ur10_fkine_tcp if self.tcp_mode else ur10_fkine
         self.T_current = fk_func(self.joint_states) 

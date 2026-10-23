@@ -1,11 +1,12 @@
 import sys
 import time
+import socket
 import threading
 import torch
 from scipy.spatial.distance import cdist
 import numpy as np
 sys.path.append('./NatNet_SDK/samples/PythonClient')
-from NatNetClient import NatNetClient 
+from NatNetClient import NatNetClient, get_message_id
 import matplotlib.pyplot as plt
 from collections import deque
 
@@ -121,10 +122,220 @@ class DLOTracker_:
         # volcar en GPU
         self.marker_positions.copy_(self.temp_cpu, non_blocking=True)
 
-class DLOTracker_Mean:
-    def __init__(self, client_address: str, server_address: str, num_markers: int, device, window_size=7):
+# ---------------------------------------------------------------------------
+# Cliente NatNet que siempre procesa el frame más reciente
+# ---------------------------------------------------------------------------
+class LatestFrameNatNetClient(NatNetClient):
+    """
+    El hilo de datos del SDK hace un recvfrom bloqueante y desempaqueta TODOS los paquetes en orden
+    (en Python puro). Si el desempaquetado va más lento que el OptiTrack (~180 Hz), p.ej. porque el
+    GIL está ocupado con torch/rosbridge, los paquetes se acumulan en el buffer del socket y los datos
+    llegan con un retraso que se mantiene (en el dataset: saltos entre ~50 ms y ~225 ms).
+    Aquí, tras cada recvfrom, se vacía el socket y solo se desempaqueta el último frame de datos.
+    """
+    def __init__(self):
+        super().__init__()
+        self.frames_skipped = 0              # frames descartados por llegar con retraso
 
-        self.client = NatNetClient()
+    # Sustituye a NatNetClient.__data_thread_function (name mangling)
+    def _NatNetClient__data_thread_function(self, in_socket, stop, gprint_level):
+        recv_buffer_size = 128 * 1024
+        timeout = in_socket.gettimeout()
+        while not stop():
+            try:
+                data, _ = in_socket.recvfrom(recv_buffer_size)
+            except socket.timeout:
+                continue
+            except OSError as msg:
+                if not stop():
+                    print("ERROR: data socket access error occurred:\n  %s" % msg)
+                    return 1
+                continue
+
+            latest = None
+            in_socket.setblocking(False)
+            try:
+                while True:
+                    if len(data) > 0:
+                        if get_message_id(data) == self.NAT_FRAMEOFDATA:
+                            if latest is not None:
+                                self.frames_skipped += 1
+                            latest = data
+                        else:
+                            self._NatNetClient__process_message(data, 0)
+                    data, _ = in_socket.recvfrom(recv_buffer_size)
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError as msg:
+                if not stop():
+                    print("ERROR: data socket access error occurred:\n  %s" % msg)
+            finally:
+                in_socket.settimeout(timeout)
+
+            if latest is not None:
+                self._NatNetClient__process_message(latest, gprint_level())
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Asignación robusta de marcadores (base / punta)
+# ---------------------------------------------------------------------------
+class TwoMarkerAssigner:
+    """
+    Mantiene la identidad de los dos marcadores entre frames: índice 0 = punta (p_e), 1 = base (p_b).
+
+    - Inicialización: la base es el marcador más alto en Z o el más cercano a `init_base_position` si se
+      da. La regla de Z solo es válida con el cable colgando en reposo, así que se exigen `init_frames`
+      frames con los marcadores quietos (< `init_still` m entre frames). Si no se da `cable_length`, solo
+      cuentan los frames con exactamente 2 marcadores (los reflejos intermitentes no rompen la inicialización).
+    - Seguimiento: entre todas las hipótesis (par punta/base, o solo uno visible) se escoge la de menor
+      distancia a la posición predicha (velocidad constante), con puertas de distancia y la restricción
+      de longitud del cable |punta - base| ~ L. La ordenación por un eje no interviene, así que no se
+      intercambian aunque cambie su orden en Z.
+    - Un marcador que no se encuentra se marca como no válido y conserva su última posición; nunca se
+      rellena con el otro marcador.
+    """
+    END, BASE = 0, 1
+
+    def __init__(self, cable_length=None, length_tol=0.05, max_speed=(8.0, 1.0), gate_margin=0.02,
+                 max_missing_s=0.25, init_base_position=None, init_frames=10, init_still=0.005, base_radius=None):
+        self.L = cable_length                 # None -> se mide en la inicialización
+        self.length_tol = length_tol          # m
+        self.max_speed = np.asarray(max_speed, dtype=float)   # m/s (punta, base)
+        self.gate_margin = gate_margin        # m
+        self.max_missing_s = max_missing_s    # s sin ver un marcador -> se reinicia su puerta
+        self.init_base_position = None if init_base_position is None else np.asarray(init_base_position, float)
+        self.init_frames = init_frames
+        self.init_still = init_still
+        self.base_radius = base_radius        # opcional: la base no se aleja más de esto de su posición inicial
+        self.reset()
+
+    def reset(self):
+        self.pos = np.zeros((2, 3))
+        self.vel = np.zeros((2, 3))
+        self.t_seen = np.full(2, -np.inf)
+        self.valid = np.zeros(2, dtype=bool)
+        self.initialized = False
+        self._init_count = 0
+        self._init_prev = None
+        self.base_anchor = None
+
+    # --- inicialización ---
+    def _init_pair(self, P):
+        if len(P) < 2:
+            return None
+        if self.init_base_position is not None:
+            b = int(np.argmin(np.linalg.norm(P - self.init_base_position, axis=1)))
+            d = np.linalg.norm(P - P[b], axis=1); d[b] = -1
+            if self.L is not None:
+                d = np.where(d < 0, np.inf, np.abs(d - self.L))
+                e = int(np.argmin(d))
+            else:
+                e = int(np.argmax(d))
+        else:
+            top2 = np.argsort(P[:, 2])[::-1][:2]
+            b, e = int(top2[0]), int(top2[1])
+        if self.L is not None and abs(np.linalg.norm(P[e] - P[b]) - self.L) > self.length_tol:
+            return None
+        return P[e], P[b]
+
+    def _try_initialize(self, P, t):
+        if self.L is None and len(P) != 2:
+            return                            # sin longitud conocida: solo frames con exactamente 2 marcadores (sin reflejos)
+        pair = self._init_pair(P)
+        if pair is None:
+            self._init_count, self._init_prev = 0, None
+            return
+        pair = np.stack(pair)
+        if self._init_prev is not None and np.linalg.norm(pair - self._init_prev, axis=1).max() > self.init_still:
+            self._init_count = 0
+        self._init_prev = pair
+        self._init_count += 1
+        if self._init_count >= self.init_frames:
+            self.pos[:] = pair
+            self.vel[:] = 0
+            self.t_seen[:] = t
+            self.valid[:] = True
+            if self.L is None:
+                self.L = float(np.linalg.norm(pair[0] - pair[1]))
+            self.base_anchor = pair[1].copy()
+            self.initialized = True
+
+    # --- seguimiento ---
+    def update(self, P, t):
+        """P: (n, 3) posiciones de marcadores no ocluidos del frame; t: tiempo del frame (s)."""
+        P = np.asarray(P, dtype=float).reshape(-1, 3)
+        if not self.initialized:
+            self._try_initialize(P, t)
+            return self.pos.copy(), self.valid.copy()
+
+        dt = np.clip(t - self.t_seen, 1e-3, None)
+        lost = dt > self.max_missing_s
+        pred = self.pos + self.vel * np.minimum(dt, self.max_missing_s)[:, None]
+        gate = self.max_speed * np.minimum(dt, self.max_missing_s) + self.gate_margin
+        gate[lost] = np.inf                   # perdido: cualquier candidato que cumpla la longitud
+
+        d = np.linalg.norm(P[:, None, :] - pred[None, :, :], axis=2)   # (n, 2)
+        ok = d <= gate[None, :]
+        if self.base_radius is not None and self.base_anchor is not None:
+            ok[:, self.BASE] &= np.linalg.norm(P - self.base_anchor, axis=1) <= self.base_radius
+
+        best, best_cost = (None, None), np.inf
+        n = len(P)
+        for e in range(n):                    # hipótesis con los dos marcadores
+            for b in range(n):
+                if e == b or not (ok[e, self.END] and ok[b, self.BASE]):
+                    continue
+                len_err = abs(np.linalg.norm(P[e] - P[b]) - self.L)
+                if len_err > self.length_tol:
+                    continue
+                cost = d[e, self.END] + d[b, self.BASE] + len_err
+                if cost < best_cost:
+                    best, best_cost = (e, b), cost
+        if best == (None, None):              # solo uno visible (sin perder la identidad del otro)
+            for i, other in ((self.END, self.BASE), (self.BASE, self.END)):
+                for j in range(n):
+                    if not ok[j, i] or lost[i]:
+                        continue
+                    # si el otro marcador está bien localizado, exigir la longitud del cable
+                    if not lost[other] and abs(np.linalg.norm(P[j] - pred[other]) - self.L) > self.length_tol + gate[other]:
+                        continue
+                    cost = d[j, i] + 1.0      # penaliza frente a las hipótesis de par
+                    if cost < best_cost:
+                        best = (j, None) if i == self.END else (None, j)
+                        best_cost = cost
+
+        self.valid[:] = False
+        for i, j in ((self.END, best[0]), (self.BASE, best[1])):
+            if j is None:
+                continue
+            new = P[j]
+            if np.isfinite(self.t_seen[i]) and not lost[i]:
+                v = (new - self.pos[i]) / dt[i]
+                self.vel[i] = 0.5 * self.vel[i] + 0.5 * v
+            else:
+                self.vel[i] = 0
+            self.pos[i] = new
+            self.t_seen[i] = t
+            self.valid[i] = True
+        return self.pos.copy(), self.valid.copy()
+
+
+class DLOTracker_Mean:
+    """
+    Tracker de los dos marcadores del DLO. marker_positions[0] = punta (p_e), marker_positions[1] = base (p_b).
+
+    Cambios respecto a la versión anterior:
+      - Siempre usa el frame más reciente del OptiTrack (LatestFrameNatNetClient) -> sin retraso acumulado.
+      - Identidad de marcadores por seguimiento + longitud del cable (TwoMarkerAssigner), no por orden en Z.
+      - Descarta marcadores ocluidos y nunca mezcla los buffers de la media entre marcadores.
+      - Guarda número de frame, timestamp de Motive y hora de recepción (get_state) para poder medir y
+        registrar la latencia.
+    """
+    def __init__(self, client_address: str, server_address: str, num_markers: int, device, window_size=7,
+                 **assigner_kwargs):
+
+        self.client = LatestFrameNatNetClient()
         self.client.set_client_address(client_address)
         self.client.set_server_address(server_address)
         self.client.set_use_multicast(False)
@@ -137,16 +348,19 @@ class DLOTracker_Mean:
         self.temp_cpu = torch.zeros((2, 3), dtype=torch.float32)
         self.valid = torch.zeros(2, dtype=torch.bool)
 
+        self.assigner = TwoMarkerAssigner(**assigner_kwargs)
+        self.lock = threading.Lock()
+        self.frame_number = -1
+        self.mocap_timestamp = float('nan')   # s, reloj de Motive
+        self.t_recv = float('nan')            # s, time.perf_counter() al procesar el frame
+
         self.client.new_frame_with_data_listener = self._on_frame
         self.running = False
         self.last_frame = None
 
-        # --- buffers para media ---
+        # --- buffers para media (uno por identidad de marcador) ---
         self.window_size = window_size
-        self.buffers = [
-            [deque(maxlen=window_size) for _ in range(3)]
-            for _ in range(self.num_markers)
-        ]
+        self.buffers = [deque(maxlen=window_size) for _ in range(self.num_markers)]
 
     def start(self):
         if not self.running:
@@ -159,45 +373,53 @@ class DLOTracker_Mean:
         self.running = False
         self.client.shutdown()
 
-    def _smooth_with_mean(self, i, pos):
-        for ax in range(3):
-            self.buffers[i][ax].append(pos[ax])
-            pos[ax] = np.mean(self.buffers[i][ax])
-        return pos
+    def get_state(self):
+        """Copia coherente: posiciones (2,3) np, válidos, nº de frame, timestamp Motive, edad del dato (s)."""
+        with self.lock:
+            return {
+                "positions": self.temp_cpu.numpy().copy(),
+                "valid": self.valid.numpy().copy(),
+                "frame_number": self.frame_number,
+                "mocap_timestamp": self.mocap_timestamp,
+                "age": time.perf_counter() - self.t_recv,
+                "frames_skipped": self.client.frames_skipped,
+            }
 
     def _on_frame(self, frameData):
-
+        t_recv = time.perf_counter()
         mocap_data = frameData["mocap_data"]
         if mocap_data is None:
             return
-        
-        # Print Timestamp
-        if self.last_frame is not None and mocap_data.prefix_data.frame_number < self.last_frame:
+
+        frame_number = mocap_data.prefix_data.frame_number
+        if self.last_frame is not None and frame_number < self.last_frame:
             print("Frame number reset detected.")
-           
-        self.last_frame = mocap_data.prefix_data.frame_number
-    
+            self.assigner.reset()
+            for b in self.buffers:
+                b.clear()
+        self.last_frame = frame_number
+
+        timestamp = frameData.get("timestamp", -1)
+        t_frame = timestamp if timestamp is not None and timestamp >= 0 else t_recv
+
         labeled = mocap_data.labeled_marker_data.labeled_marker_list
-        if len(labeled) == 0:
-            return
-
         detected = np.array(
-            [[m.pos[0], m.pos[1], m.pos[2]] for m in labeled],
+            [[m.pos[0], m.pos[1], m.pos[2]] for m in labeled if not (m.param & 0x01)],   # sin ocluidos
             dtype=np.float32,
-        )
+        ).reshape(-1, 3)
 
-        order = np.argsort(detected[:, 2])[::-1]  # Ordenar por Z de mayor a menor
-        detected = detected[order][:2]           # Seleccionar los dos mayores
-        detected = detected[np.argsort(detected[:, 2])]  # Reordenar para que el menor esté primero
+        pos, valid = self.assigner.update(detected, t_frame)
 
-        self.valid[:] = False
-
-        for i in range(detected.shape[0]):
-            smoothed = self._smooth_with_mean(i, detected[i].copy())
-            self.temp_cpu[i] = torch.from_numpy(smoothed)
-            self.valid[i] = True
-
-        self.marker_positions.copy_(self.temp_cpu, non_blocking=True)
+        with self.lock:
+            for i in range(self.num_markers):
+                if valid[i]:
+                    self.buffers[i].append(pos[i])
+                    self.temp_cpu[i] = torch.from_numpy(np.mean(self.buffers[i], axis=0).astype(np.float32))
+            self.valid[:] = torch.from_numpy(valid)
+            self.frame_number = frame_number
+            self.mocap_timestamp = t_frame
+            self.t_recv = t_recv
+            self.marker_positions.copy_(self.temp_cpu, non_blocking=True)
 
 
 
