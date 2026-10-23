@@ -206,12 +206,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------- Configuración ----------------
 ALIGN_MOCAP = True        # re-sincroniza el mocap con el robot (retardo variable en los datos antiguos)
 ENC_HISTORY = 10          # frames pasados que ve el encoder (1 = solo t0, encoder MLP)
-ENC_COMMANDS = True       # el encoder ve también el comando u de cada frame (comandos enviados aún no ejecutados)
+ENC_COMMANDS = False      # el encoder ve también el comando u de cada frame (comandos enviados aún no ejecutados)
 VAL_TRAJ_IDS = None       # p.ej. [3, 9, 17, 39, 46, 49]: valida con trayectorias enteras no vistas
 LATENT_DIM = 64
-DROPOUT = 0.15
-NOISE_STD = 0.05          # ruido en la entrada del encoder (escalada), solo en training
-WEIGHT_DECAY = 1e-4
+DROPOUT = 0.05
+NOISE_STD = 0.02          # ruido en la entrada del encoder (escalada), solo en training
+WEIGHT_DECAY = 1e-5
 
 # Cargar trayectorias
 vec = list(range(24)) + list(range(37, 41)) + list(range(44, 50))
