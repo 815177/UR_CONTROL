@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from training.nets import SimpleEncoder, RnnDynamics, SimpleDecoder, DLOModel, LstmDynamics, GruDynamics, DLOModel
+from training.nets import SimpleEncoder, RnnDynamics, SimpleDecoder, DLOModel, LstmDynamics, GruDynamics, HistoryGruEncoder
 from training.process_data import *
+from training.align import align_mocap_to_robot
 import torch
 import matplotlib.pyplot as plt
 import os
@@ -40,7 +41,7 @@ def evaluate_and_plot(model, train_ds, val_ds, batch_size=16, device='cuda', sav
             U_dyn_batch = ds.U_dyn[i:i+batch_size].to(device)
             U_dec_batch = ds.U_decoder[i:i+batch_size].to(device)
             with torch.no_grad():
-                _, Y_pred = model(u_enc_batch[:, 0, :], U_dyn_batch, U_dec_batch)
+                _, Y_pred = model(u_enc_batch, U_dyn_batch, U_dec_batch)
             Y_preds.append(Y_pred.cpu())
         return torch.cat(Y_preds, dim=0)
 
@@ -148,7 +149,7 @@ def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cud
             )
 
             optimizer.zero_grad()
-            _, Y_pred = model(u_enc[:, 0, :], U_dyn, U_dec)
+            _, Y_pred = model(u_enc, U_dyn, U_dec)
 
             # Aplicar solo hasta rollout_horizon
             # loss = criterion(Y_pred[:, :rollout_horizon], Y[:, :rollout_horizon])
@@ -171,7 +172,7 @@ def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cud
                 u_enc, U_dyn, U_dec, Y = (
                     u_enc.to(device), U_dyn.to(device), U_dec.to(device), Y.to(device)
                 )
-                _, Y_pred = model(u_enc[:, 0, :], U_dyn, U_dec)
+                _, Y_pred = model(u_enc, U_dyn, U_dec)
                 # val_loss += criterion(
                 #     Y_pred[:, :rollout_horizon], Y[:, :rollout_horizon]
                 # ).item() * u_enc.size(0)
@@ -202,30 +203,44 @@ def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cud
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ---------------- Configuración ----------------
+ALIGN_MOCAP = True        # re-sincroniza el mocap con el robot (retardo variable en los datos antiguos)
+ENC_HISTORY = 10          # frames pasados que ve el encoder (1 = solo t0, encoder MLP)
+VAL_TRAJ_IDS = None       # p.ej. [3, 9, 17, 39, 46, 49]: valida con trayectorias enteras no vistas
+LATENT_DIM = 64
+DROPOUT = 0.15
+NOISE_STD = 0.05          # ruido en la entrada del encoder (escalada), solo en training
+WEIGHT_DECAY = 1e-4
+
 # Cargar trayectorias
 vec = list(range(24)) + list(range(37, 41)) + list(range(44, 50))
 # vec = list(range(150))
 # trajs = load_trajs_old(vec)
 trajs = load_trajs(vec)
+if ALIGN_MOCAP:
+    trajs = align_mocap_to_robot(trajs, verbose=True)
 
 train_ds, val_ds = construct_train_val_datasets_from_trajs(
-    trajs, rollout_length=40, val_size=0.2, seed=800
+    trajs, rollout_length=40, val_size=0.2, seed=800, enc_history=ENC_HISTORY, val_traj_ids=VAL_TRAJ_IDS
 )
 
 # Construir modelo
-# Más pequeño y más regularizado: con ~34 trayectorias reales el GRU de 160 memorizaba el training
-latent_dim = 64
-mlp_dropout = 0.15
-encoder_params = {"input_dim": 18, "hidden_dims": [32, 32], "output_dim": latent_dim}
-dynamics_params = {"input_dim": 2, "hidden_dim": latent_dim, "n_layers": 1}
-decoder_params = {"input_dim": latent_dim + 2, "hidden_dims": [32, 32], "output_dim": 3}
+if ENC_HISTORY > 1:
+    encoder_type = "gru"
+    encoder_params = {"input_dim": 18, "hidden_dim": 64, "output_dim": LATENT_DIM}
+    encoder = HistoryGruEncoder(**encoder_params, dropout=DROPOUT, device=device)
+else:
+    encoder_type = "mlp"
+    encoder_params = {"input_dim": 18, "hidden_dims": [32, 32], "output_dim": LATENT_DIM}
+    encoder = SimpleEncoder(**encoder_params, dropout=DROPOUT, device=device)
+dynamics_params = {"input_dim": 2, "hidden_dim": LATENT_DIM, "n_layers": 1}
+decoder_params = {"input_dim": LATENT_DIM + 2, "hidden_dims": [32, 32], "output_dim": 3}
 model_kwargs = {"n_layers": 1, "bound_h0": True}
 
-encoder = SimpleEncoder(**encoder_params, dropout=mlp_dropout, device=device)
 dynamics = GruDynamics(**dynamics_params, device=device)
-decoder = SimpleDecoder(**decoder_params, dropout=mlp_dropout, device=device)
+decoder = SimpleDecoder(**decoder_params, dropout=DROPOUT, device=device)
 model = DLOModel(encoder, dynamics, decoder, **model_kwargs,
-                 noise_std=0.05,                            # ruido en la entrada del encoder (escalada)
+                 noise_std=NOISE_STD,
                  enc_scaler=train_ds.encoder_scalar,
                  dec_scaler=train_ds.decoder_scalar)
 
@@ -233,7 +248,7 @@ torch.cuda.empty_cache()
 
 # Entrenamiento
 trained_model = train_model(model, train_ds, val_ds, n_epochs=200, batch_size=64, device=device,
-                            weight_decay=1e-4, patience=20)
+                            weight_decay=WEIGHT_DECAY, patience=20)
 
 # Evaluación
 Y_train_pred, Y_val_pred = evaluate_and_plot(trained_model, train_ds, val_ds, batch_size=64, device=device)
@@ -241,11 +256,14 @@ Y_train_pred, Y_val_pred = evaluate_and_plot(trained_model, train_ds, val_ds, ba
 checkpoint = {
     "model_state": model.state_dict(), 
     "model_params": {
+        "encoder_type": encoder_type,
         "encoder_params": encoder_params,
         "dynamics_params": dynamics_params,
         "decoder_params": decoder_params
     },
     "model_kwargs": model_kwargs,
+    "enc_history": ENC_HISTORY,
+    "align_mocap": ALIGN_MOCAP,
     "Dyn_scaler": train_ds.dyn_scalar,
     "Output_scaler": train_ds.output_scalar,
     "Enc_scaler": train_ds.encoder_scalar,
@@ -255,7 +273,7 @@ checkpoint = {
 torch.save(checkpoint, "./models/model_simple.pth")
 
 horizon_test, _ = construct_train_val_datasets_from_trajs(
-    trajs, rollout_length=160, val_size=0.5, seed=800
+    trajs, rollout_length=160, val_size=0.5, seed=800, enc_history=ENC_HISTORY
 )
 
 u_enc, U_dyn, U_dec, Y = horizon_test[150]
@@ -267,7 +285,7 @@ U_dyn = train_ds.dyn_scalar.transform(horizon_test.dyn_scalar.inverse_transform(
 
 import time
 start = time.time()
-_, Y_pred = model(u_enc[0].unsqueeze(0), U_dyn.unsqueeze(0), U_dec.unsqueeze(0))
+_, Y_pred = model(u_enc.unsqueeze(0), U_dyn.unsqueeze(0), U_dec.unsqueeze(0))
 end = time.time()
 print(end-start)
 
@@ -302,7 +320,7 @@ for i in range(0, n_rollouts, 16):
     U_dyn_batch = val_ds.U_dyn[i:i+16].to(device)
     U_dec_batch = val_ds.U_decoder[i:i+16].to(device)
     with torch.no_grad():
-        _, Y_pred = model(u_enc_batch[:, 0, :], U_dyn_batch, U_dec_batch)
+        _, Y_pred = model(u_enc_batch, U_dyn_batch, U_dec_batch)
     Y_preds.append(Y_pred.cpu())
 torch.cat(Y_preds, dim=0)
 

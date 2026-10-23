@@ -63,17 +63,29 @@ def rolling_window(traj_length: int, window: int):
     n_windows = traj_length - window + 1
     return np.arange(n_windows)[:, None] + np.arange(window)[None, :]
 
-def divide_into_rolling_windows(trajs, window: int):
+def divide_into_rolling_windows(trajs, window: int, skip: int = 0):
+    """Ventanas de window+1 pasos que empiezan en t0 = skip, skip+1, ..."""
     rollouts = []
     for traj in trajs:
-        if traj.shape[0] > window:
-            idxs = rolling_window(traj.shape[0], window + 1)
+        if traj.shape[0] > window + skip:
+            idxs = rolling_window(traj.shape[0], window + 1)[skip:]
             rollouts.append(traj[idxs])
     return rollouts
 
 
-def divide_into_rolling_windows_and_stack(trajs, window: int):
-    rollouts = divide_into_rolling_windows(trajs, window)
+def divide_into_rolling_windows_and_stack(trajs, window: int, skip: int = 0):
+    rollouts = divide_into_rolling_windows(trajs, window, skip)
+    return torch.from_numpy(np.vstack(rollouts)).float()
+
+
+def divide_into_history_windows_and_stack(trajs, window: int, history: int):
+    """Para cada ventana (t0 = history-1, history, ...): los `history` frames que terminan en t0 (t0 al final)"""
+    rollouts = []
+    for traj in trajs:
+        if traj.shape[0] > window + history - 1:
+            t0 = np.arange(history - 1, traj.shape[0] - window)
+            idxs = t0[:, None] + np.arange(-history + 1, 1)[None, :]
+            rollouts.append(traj[idxs])
     return torch.from_numpy(np.vstack(rollouts)).float()
 
 
@@ -107,19 +119,30 @@ def get_train_val_idxs(trajs, val_size: float, seed: int):
     return train_idxs, val_idxs
 
 # ---------- construcción dataset ----------
-def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size: float, seed: int):
+def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size: float, seed: int,
+                                            enc_history: int = 1, val_traj_ids=None):
+    """
+    enc_history:  nº de frames pasados que ve el encoder; U_encoder es (N, enc_history, 18) con t0 al final.
+    val_traj_ids: si se da, esas trayectorias (traj.n_traj) van enteras a validación y el resto entero a
+                  train (mide la generalización a trayectorias nuevas); si no, split temporal con val_size.
+    """
     # split
-    train_idxs, val_idxs = get_train_val_idxs(trajs, val_size, seed)
-    train_trajs = slice_trajs(trajs, train_idxs)
-    val_trajs = slice_trajs(trajs, val_idxs)
+    if val_traj_ids is not None:
+        train_trajs = [t for t in trajs if t.n_traj not in val_traj_ids]
+        val_trajs = [t for t in trajs if t.n_traj in val_traj_ids]
+    else:
+        train_idxs, val_idxs = get_train_val_idxs(trajs, val_size, seed)
+        train_trajs = slice_trajs(trajs, train_idxs)
+        val_trajs = slice_trajs(trajs, val_idxs)
+    skip = enc_history - 1                  # las primeras ventanas no tienen historia completa
 
     # encoder (sin escalar: DLOModel aplica enc_scalar en el forward)
     enc_train = construct_encoder_inputs(train_trajs)
     enc_val = construct_encoder_inputs(val_trajs)
     enc_scalar = TorchStandardScaler()
     enc_scalar.fit(np.vstack(enc_train))
-    U_enc_train = divide_into_rolling_windows_and_stack(enc_train, rollout_length)
-    U_enc_val = divide_into_rolling_windows_and_stack(enc_val, rollout_length)
+    U_enc_train = divide_into_history_windows_and_stack(enc_train, rollout_length, enc_history)
+    U_enc_val = divide_into_history_windows_and_stack(enc_val, rollout_length, enc_history)
 
     # dynamics
     dyn_train = construct_dyn_inputs(train_trajs)
@@ -128,16 +151,16 @@ def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size
     dyn_scalar.fit(np.vstack(dyn_train))
     dyn_train_scaled = [dyn_scalar.transform(t) for t in dyn_train]
     dyn_val_scaled = [dyn_scalar.transform(t) for t in dyn_val]
-    U_dyn_train = divide_into_rolling_windows_and_stack(dyn_train_scaled, rollout_length)[:, 1:, :]
-    U_dyn_val = divide_into_rolling_windows_and_stack(dyn_val_scaled, rollout_length)[:, 1:, :]
+    U_dyn_train = divide_into_rolling_windows_and_stack(dyn_train_scaled, rollout_length, skip)[:, 1:, :]
+    U_dyn_val = divide_into_rolling_windows_and_stack(dyn_val_scaled, rollout_length, skip)[:, 1:, :]
 
     # decoder
     dec_train = construct_decoder_inputs(train_trajs)
     dec_val = construct_decoder_inputs(val_trajs)
     dec_scalar = TorchMinMaxScaler(feature_range=(-1, 1))   # sin escalar: DLOModel aplica dec_scalar
     dec_scalar.fit(np.vstack(dec_train))
-    U_dec_train = divide_into_rolling_windows_and_stack(dec_train, rollout_length)
-    U_dec_val = divide_into_rolling_windows_and_stack(dec_val, rollout_length)
+    U_dec_train = divide_into_rolling_windows_and_stack(dec_train, rollout_length, skip)
+    U_dec_val = divide_into_rolling_windows_and_stack(dec_val, rollout_length, skip)
 
     # outputs
     obs_train = construct_observations(train_trajs)
@@ -146,8 +169,8 @@ def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size
     obs_scalar.fit(np.vstack(obs_train))
     obs_train_scaled = [obs_scalar.transform(t) for t in obs_train]
     obs_val_scaled = [obs_scalar.transform(t) for t in obs_val]
-    Y_train = divide_into_rolling_windows_and_stack(obs_train_scaled, rollout_length)
-    Y_val = divide_into_rolling_windows_and_stack(obs_val_scaled, rollout_length)
+    Y_train = divide_into_rolling_windows_and_stack(obs_train_scaled, rollout_length, skip)
+    Y_val = divide_into_rolling_windows_and_stack(obs_val_scaled, rollout_length, skip)
 
     # dataset
     train_ds = TorchDLODataset(U_encoder=U_enc_train,

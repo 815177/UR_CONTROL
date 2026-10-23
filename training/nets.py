@@ -39,7 +39,28 @@ class SimpleEncoder(Encoder):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
+        if x.dim() == 3:                    # (batch, historia, features) -> solo el último frame (t0)
+            x = x[:, -1]
         return self.net(x)
+
+
+class HistoryGruEncoder(Encoder):
+    """
+    Estima el estado inicial a partir de los últimos K frames de features (batch, K, input_dim),
+    ordenados del más antiguo al más reciente (t0). Con datos reales es más robusto que un MLP
+    sobre un solo frame: las velocidades medidas son ruidosas y el estado del cable depende de la historia.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.05, device='cuda'):
+        super().__init__()
+        self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True, device=device)
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(hidden_dim, output_dim, device=device)
+
+    def forward(self, x):
+        if x.dim() == 2:                    # un solo frame
+            x = x.unsqueeze(1)
+        _, h = self.gru(x)
+        return self.out(self.dropout(h[-1]))
 
 
 class SimpleDecoder(Decoder):
@@ -183,6 +204,7 @@ class DLOModel(nn.Module):
         bound_h0:   aplica tanh a la salida del encoder (el estado oculto del GRU vive en [-1, 1]).
         enc_scaler, dec_scaler: TorchMinMaxScaler ajustados en train. Las entradas se pasan sin
                     escalar y se escalan aquí, así el MPC no tiene que hacerlo. None = sin escalar.
+        u_enc puede ser (batch, features) o (batch, K, features) con los K últimos frames (t0 al final).
         """
         super().__init__()
         self.encoder = encoder
@@ -223,3 +245,18 @@ class DLOModel(nn.Module):
         Y_seq = self.decoder(torch.cat([X_seq, U_dec], dim=-1))
 
         return X_seq, Y_seq
+
+def build_model_from_checkpoint(checkpoint, device='cuda'):
+    """Reconstruye el DLOModel de un checkpoint de train_simple.py (también los antiguos, sin campos nuevos)."""
+    params = checkpoint["model_params"]
+    if params.get("encoder_type", "mlp") == "gru":
+        encoder = HistoryGruEncoder(**params["encoder_params"], device=device)
+    else:
+        encoder = SimpleEncoder(**params["encoder_params"], device=device)
+    dynamics = GruDynamics(**params["dynamics_params"], device=device)
+    decoder = SimpleDecoder(**params["decoder_params"], device=device)
+    model = DLOModel(encoder, dynamics, decoder, **checkpoint.get("model_kwargs", {}),
+                     enc_scaler=checkpoint.get("Enc_scaler"), dec_scaler=checkpoint.get("Dec_scaler"))
+    model.to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    return model

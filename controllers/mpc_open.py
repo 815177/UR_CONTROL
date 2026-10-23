@@ -18,18 +18,24 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ------------ LOAD MODEL -------------- #
 checkpoint = torch.load("../models/model_simple.pth", map_location=device, weights_only=False)
 
-encoder = SimpleEncoder(**checkpoint["model_params"]["encoder_params"], device=device)
-dynamics = GruDynamics(**checkpoint["model_params"]["dynamics_params"], device=device)
-decoder = SimpleDecoder(**checkpoint["model_params"]["decoder_params"], device=device)
-
-model = DLOModel(encoder, dynamics, decoder, **checkpoint.get("model_kwargs", {}),
-                 enc_scaler=checkpoint.get("Enc_scaler"), dec_scaler=checkpoint.get("Dec_scaler"))
-model.to(device)
-
-model.load_state_dict(checkpoint["model_state"])
+model = build_model_from_checkpoint(checkpoint, device)
+enc_history = checkpoint.get("enc_history", 1)      # nº de frames pasados que ve el encoder
 
 Dyn_scaler = checkpoint["Dyn_scaler"]
 Output_scaler = checkpoint["Output_scaler"]
+
+# Historia del encoder (si el modelo usa los últimos enc_history frames, uno por paso de control)
+from collections import deque
+enc_buffer = deque(maxlen=enc_history)
+def encoder_input(u_enc):
+    """Añade el frame actual a la historia y devuelve la entrada del encoder: (18,) o (enc_history, 18)"""
+    if enc_history == 1:
+        return u_enc
+    if not enc_buffer:
+        enc_buffer.extend([u_enc] * enc_history)
+    else:
+        enc_buffer.append(u_enc)
+    return torch.stack(list(enc_buffer))
 
 # -----------------------------------------------
 ur10_control = UR10Control(host_ip='CMP00-180723AD.local')
@@ -175,7 +181,7 @@ u_enc = torch.cat([
 end_idx = H + 1
 Y = Output_scaler.transform(dlo_path[:end_idx])
 
-actions = mpc_step(u_enc, u_pitch_yaw, Y, actions,  gd_iters=5000, lr=95e-4, alpha=1.5)
+actions = mpc_step(encoder_input(u_enc), u_pitch_yaw, Y, actions,  gd_iters=5000, lr=95e-4, alpha=1.5)
 
 # ================ PLOTTING INITIAL ACTIONS =================
 actions_clone = actions.clone()
@@ -193,7 +199,7 @@ plt.show()
 U_dyn_scaled = Dyn_scaler.transform(actions)
 U_dyn_input = U_dyn_scaled.unsqueeze(0)
 U_dec_input = torch.cat([u_pitch_yaw.unsqueeze(0), actions], dim=0).unsqueeze(0)
-u_enc_input = u_enc.unsqueeze(0)
+u_enc_input = (torch.stack(list(enc_buffer)) if enc_history > 1 else u_enc).unsqueeze(0)
 
 with torch.no_grad():
     _, pred = model(u_enc_input, U_dyn_input.to(device), U_dec_input.to(device))
