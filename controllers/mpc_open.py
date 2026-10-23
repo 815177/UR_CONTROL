@@ -20,6 +20,7 @@ checkpoint = torch.load("../models/model_simple.pth", map_location=device, weigh
 
 model = build_model_from_checkpoint(checkpoint, device)
 enc_history = checkpoint.get("enc_history", 1)      # nº de frames pasados que ve el encoder
+enc_commands = checkpoint.get("enc_commands", False)  # el encoder ve también el último comando enviado
 
 Dyn_scaler = checkpoint["Dyn_scaler"]
 Output_scaler = checkpoint["Output_scaler"]
@@ -27,8 +28,10 @@ Output_scaler = checkpoint["Output_scaler"]
 # Historia del encoder (si el modelo usa los últimos enc_history frames, uno por paso de control)
 from collections import deque
 enc_buffer = deque(maxlen=enc_history)
-def encoder_input(u_enc):
-    """Añade el frame actual a la historia y devuelve la entrada del encoder: (18,) o (enc_history, 18)"""
+def encoder_input(u_enc, u_pitch_yaw):
+    """Añade el frame actual a la historia y devuelve la entrada del encoder: (D,) o (enc_history, D)"""
+    if enc_commands:
+        u_enc = torch.cat([u_enc, u_pitch_yaw])
     if enc_history == 1:
         return u_enc
     if not enc_buffer:
@@ -181,7 +184,7 @@ u_enc = torch.cat([
 end_idx = H + 1
 Y = Output_scaler.transform(dlo_path[:end_idx])
 
-actions = mpc_step(encoder_input(u_enc), u_pitch_yaw, Y, actions,  gd_iters=5000, lr=95e-4, alpha=1.5)
+actions = mpc_step(encoder_input(u_enc, u_pitch_yaw), u_pitch_yaw, Y, actions,  gd_iters=5000, lr=95e-4, alpha=1.5)
 
 # ================ PLOTTING INITIAL ACTIONS =================
 actions_clone = actions.clone()
@@ -199,7 +202,8 @@ plt.show()
 U_dyn_scaled = Dyn_scaler.transform(actions)
 U_dyn_input = U_dyn_scaled.unsqueeze(0)
 U_dec_input = torch.cat([u_pitch_yaw.unsqueeze(0), actions], dim=0).unsqueeze(0)
-u_enc_input = (torch.stack(list(enc_buffer)) if enc_history > 1 else u_enc).unsqueeze(0)
+u_enc_input = (torch.stack(list(enc_buffer)) if enc_history > 1 else
+               (torch.cat([u_enc, u_pitch_yaw]) if enc_commands else u_enc)).unsqueeze(0)
 
 with torch.no_grad():
     _, pred = model(u_enc_input, U_dyn_input.to(device), U_dec_input.to(device))

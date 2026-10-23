@@ -28,7 +28,8 @@ trajs = load_trajs(vec)
 if checkpoint.get("align_mocap", False):
     trajs = align_mocap_to_robot(trajs)
 horizon_test, _ = construct_train_val_datasets_from_trajs(
-    trajs, rollout_length=160, val_size=0.5, seed=800, enc_history=enc_history
+    trajs, rollout_length=160, val_size=0.5, seed=800, enc_history=enc_history,
+    enc_commands=checkpoint.get("enc_commands", False)
 )
 
 u_enc, U_dyn, U_dec, Y = horizon_test[450]

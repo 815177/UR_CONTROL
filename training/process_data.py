@@ -120,9 +120,12 @@ def get_train_val_idxs(trajs, val_size: float, seed: int):
 
 # ---------- construcción dataset ----------
 def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size: float, seed: int,
-                                            enc_history: int = 1, val_traj_ids=None):
+                                            enc_history: int = 1, val_traj_ids=None, enc_commands: bool = False):
     """
     enc_history:  nº de frames pasados que ve el encoder; U_encoder es (N, enc_history, 18) con t0 al final.
+    enc_commands: añade al encoder el comando u de cada frame (20 features). Con ~200 ms de retardo
+                  comando->robot, en t0 hay ~4 comandos enviados pero aún no ejecutados que el estado medido
+                  no refleja.
     val_traj_ids: si se da, esas trayectorias (traj.n_traj) van enteras a validación y el resto entero a
                   train (mide la generalización a trayectorias nuevas); si no, split temporal con val_size.
     """
@@ -139,6 +142,9 @@ def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size
     # encoder (sin escalar: DLOModel aplica enc_scalar en el forward)
     enc_train = construct_encoder_inputs(train_trajs)
     enc_val = construct_encoder_inputs(val_trajs)
+    if enc_commands:
+        enc_train = [np.hstack([e, u]) for e, u in zip(enc_train, construct_dyn_inputs(train_trajs))]
+        enc_val = [np.hstack([e, u]) for e, u in zip(enc_val, construct_dyn_inputs(val_trajs))]
     enc_scalar = TorchStandardScaler()
     enc_scalar.fit(np.vstack(enc_train))
     U_enc_train = divide_into_history_windows_and_stack(enc_train, rollout_length, enc_history)

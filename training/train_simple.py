@@ -206,6 +206,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------- Configuración ----------------
 ALIGN_MOCAP = True        # re-sincroniza el mocap con el robot (retardo variable en los datos antiguos)
 ENC_HISTORY = 10          # frames pasados que ve el encoder (1 = solo t0, encoder MLP)
+ENC_COMMANDS = True       # el encoder ve también el comando u de cada frame (comandos enviados aún no ejecutados)
 VAL_TRAJ_IDS = None       # p.ej. [3, 9, 17, 39, 46, 49]: valida con trayectorias enteras no vistas
 LATENT_DIM = 64
 DROPOUT = 0.15
@@ -221,17 +222,19 @@ if ALIGN_MOCAP:
     trajs = align_mocap_to_robot(trajs, verbose=True)
 
 train_ds, val_ds = construct_train_val_datasets_from_trajs(
-    trajs, rollout_length=40, val_size=0.2, seed=800, enc_history=ENC_HISTORY, val_traj_ids=VAL_TRAJ_IDS
+    trajs, rollout_length=40, val_size=0.2, seed=800, enc_history=ENC_HISTORY, val_traj_ids=VAL_TRAJ_IDS,
+    enc_commands=ENC_COMMANDS
 )
 
 # Construir modelo
+enc_dim = 18 + 2 * ENC_COMMANDS
 if ENC_HISTORY > 1:
     encoder_type = "gru"
-    encoder_params = {"input_dim": 18, "hidden_dim": 64, "output_dim": LATENT_DIM}
+    encoder_params = {"input_dim": enc_dim, "hidden_dim": 64, "output_dim": LATENT_DIM}
     encoder = HistoryGruEncoder(**encoder_params, dropout=DROPOUT, device=device)
 else:
     encoder_type = "mlp"
-    encoder_params = {"input_dim": 18, "hidden_dims": [32, 32], "output_dim": LATENT_DIM}
+    encoder_params = {"input_dim": enc_dim, "hidden_dims": [32, 32], "output_dim": LATENT_DIM}
     encoder = SimpleEncoder(**encoder_params, dropout=DROPOUT, device=device)
 dynamics_params = {"input_dim": 2, "hidden_dim": LATENT_DIM, "n_layers": 1}
 decoder_params = {"input_dim": LATENT_DIM + 2, "hidden_dims": [32, 32], "output_dim": 3}
@@ -263,6 +266,7 @@ checkpoint = {
     },
     "model_kwargs": model_kwargs,
     "enc_history": ENC_HISTORY,
+    "enc_commands": ENC_COMMANDS,
     "align_mocap": ALIGN_MOCAP,
     "Dyn_scaler": train_ds.dyn_scalar,
     "Output_scaler": train_ds.output_scalar,
@@ -273,7 +277,8 @@ checkpoint = {
 torch.save(checkpoint, "./models/model_simple.pth")
 
 horizon_test, _ = construct_train_val_datasets_from_trajs(
-    trajs, rollout_length=160, val_size=0.5, seed=800, enc_history=ENC_HISTORY
+    trajs, rollout_length=160, val_size=0.5, seed=800, enc_history=ENC_HISTORY,
+    enc_commands=ENC_COMMANDS
 )
 
 u_enc, U_dyn, U_dec, Y = horizon_test[150]

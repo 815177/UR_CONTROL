@@ -20,6 +20,7 @@ checkpoint = torch.load("../models/model_simple.pth", map_location=device, weigh
 
 model = build_model_from_checkpoint(checkpoint, device)
 enc_history = checkpoint.get("enc_history", 1)      # nº de frames pasados que ve el encoder
+enc_commands = checkpoint.get("enc_commands", False)  # el encoder ve también el último comando enviado
 
 Dyn_scaler = checkpoint["Dyn_scaler"]
 Output_scaler = checkpoint["Output_scaler"]
@@ -27,8 +28,10 @@ Output_scaler = checkpoint["Output_scaler"]
 # Historia del encoder (si el modelo usa los últimos enc_history frames, uno por paso de control)
 from collections import deque
 enc_buffer = deque(maxlen=enc_history)
-def encoder_input(u_enc):
-    """Añade el frame actual a la historia y devuelve la entrada del encoder: (18,) o (enc_history, 18)"""
+def encoder_input(u_enc, u_pitch_yaw):
+    """Añade el frame actual a la historia y devuelve la entrada del encoder: (D,) o (enc_history, D)"""
+    if enc_commands:
+        u_enc = torch.cat([u_enc, u_pitch_yaw])
     if enc_history == 1:
         return u_enc
     if not enc_buffer:
@@ -176,7 +179,7 @@ u_enc = torch.cat([
 end_idx = H + 1
 Y = Output_scaler.transform(dlo_path[:end_idx])
 
-actions = mpc_step(encoder_input(u_enc), u_pitch_yaw, Y, actions,  gd_iters=300, lr=75e-4, alpha=15)
+actions = mpc_step(encoder_input(u_enc, u_pitch_yaw), u_pitch_yaw, Y, actions,  gd_iters=300, lr=75e-4, alpha=15)
 # =========================================================================================
 
 # ================= MAIN LOOP =================
@@ -254,7 +257,7 @@ for i in range(len(t) - H - 1):
     end_idx = i + H + 1
     Y = Output_scaler.transform(dlo_path[i:end_idx])
 
-    actions = mpc_step(encoder_input(u_enc), u_pitch_yaw, Y, actions,  gd_iters=10, lr=95e-4, alpha=50)
+    actions = mpc_step(encoder_input(u_enc, u_pitch_yaw), u_pitch_yaw, Y, actions,  gd_iters=10, lr=95e-4, alpha=50)
     
     # ================= UPDATE CONTROL INPUT =================
     last_control_input = actions[0].clone()
