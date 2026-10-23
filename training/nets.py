@@ -63,7 +63,7 @@ class RnnDynamics(DynamicsNet):
     def __init__(self, input_dim, hidden_dim, n_layers=1, device='cuda'):
         """Vanilla RNN"""
         super().__init__()
-        self.rnn = nn.RNN(input_dim, hidden_dim, n_layers, dropout=0.2, batch_first=True, device=device)
+        self.rnn = nn.RNN(input_dim, hidden_dim, n_layers, dropout=0.2 if n_layers > 1 else 0.0, batch_first=True, device=device)
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
 
@@ -78,7 +78,7 @@ class LstmDynamics(DynamicsNet):
     def __init__(self, input_dim, hidden_dim, n_layers=1, device='cuda'):
         """LSTM"""
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, n_layers, dropout=0.2, batch_first=True, device=device)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, n_layers, dropout=0.2 if n_layers > 1 else 0.0, batch_first=True, device=device)
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
 
@@ -95,7 +95,7 @@ class GruDynamics(DynamicsNet):
     def __init__(self, input_dim, hidden_dim, n_layers=1, device='cuda'):
         """GRU"""
         super().__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, n_layers, dropout=0.2, batch_first=True, device=device)
+        self.gru = nn.GRU(input_dim, hidden_dim, n_layers, dropout=0.2 if n_layers > 1 else 0.0, batch_first=True, device=device)
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
 
@@ -175,26 +175,41 @@ class GruDynamics(DynamicsNet):
 #         return X_seq, Y_seq
     
 class DLOModel(nn.Module):
-    def __init__(self, encoder, dynamics, decoder, n_layers=1, noise_std=0.01):
+    def __init__(self, encoder, dynamics, decoder, n_layers=1, noise_std=0.0,
+                 bound_h0=False, enc_scaler=None, dec_scaler=None):
+        """
+        noise_std:  ruido gaussiano en la entrada del encoder (ya escalada), solo en training.
+                    Por defecto 0 para que el MPC (que llama a model.train()) no lo aplique.
+        bound_h0:   aplica tanh a la salida del encoder (el estado oculto del GRU vive en [-1, 1]).
+        enc_scaler, dec_scaler: TorchMinMaxScaler ajustados en train. Las entradas se pasan sin
+                    escalar y se escalan aquí, así el MPC no tiene que hacerlo. None = sin escalar.
+        """
         super().__init__()
         self.encoder = encoder
         self.dynamics = dynamics
         self.decoder = decoder
         self.n_layers = n_layers
         self.noise_std = noise_std
+        self.bound_h0 = bound_h0
+        self.enc_scaler = enc_scaler
+        self.dec_scaler = dec_scaler
 
     def forward(self, u_enc, U_dyn, U_dec):
 
+        # Escalado de entradas del encoder y del decoder
+        if self.enc_scaler is not None:
+            u_enc = self.enc_scaler.transform(u_enc)
+        if self.dec_scaler is not None:
+            U_dec = self.dec_scaler.transform(U_dec)
+
         # Ruido en la entrada (solo en training)
-        # if self.training:
-        #     u_enc = u_enc + self.noise_std * torch.randn_like(u_enc)
+        if self.training and self.noise_std > 0:
+            u_enc = u_enc + self.noise_std * torch.randn_like(u_enc)
 
         # Encoder -> estado inicial
         h_0 = self.encoder(u_enc)
-
-        # Ruido en el estado latente (solo en training)
-        # if self.training:
-        #     h_0 = h_0 + self.noise_std * torch.randn_like(h_0)
+        if self.bound_h0:
+            h_0 = torch.tanh(h_0)
 
         h_0_for_rnn = h_0.unsqueeze(0).repeat(self.n_layers, 1, 1)
 

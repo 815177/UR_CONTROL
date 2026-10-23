@@ -61,6 +61,23 @@ class TorchMinMaxScaler:
         else:
             raise TypeError("x debe ser numpy.ndarray o torch.Tensor")
 
+class TorchStandardScaler(TorchMinMaxScaler):
+    """(x - media) / std. Misma interfaz que TorchMinMaxScaler; menos sensible a picos que min-max."""
+    def __init__(self):
+        super().__init__(feature_range=(0.0, 1.0))
+
+    def fit(self, x):
+        if isinstance(x, np.ndarray):
+            mean, std = np.mean(x, axis=0), np.std(x, axis=0)
+        elif isinstance(x, torch.Tensor):
+            mean, std = x.mean(0), x.std(0)
+        else:
+            raise TypeError("x debe ser numpy.ndarray o torch.Tensor")
+        # Reutiliza transform/inverse_transform de min-max con data_min = media, data_max - data_min = std
+        self.data_min = mean
+        self.data_max = mean + std
+
+
 # ---------- Dataset ----------
 @dataclass
 class DLODataset:
@@ -99,7 +116,7 @@ class TorchAltDataset(Dataset):
 
 class TorchDLODataset(Dataset):
     def __init__(self, U_encoder, U_dyn, U_decoder, Y,
-                 encoder_scalar=None, dyn_scalar=None, output_scalar=None):
+                 encoder_scalar=None, dyn_scalar=None, output_scalar=None, decoder_scalar=None):
 
         self.U_encoder = U_encoder.detach().clone() if torch.is_tensor(U_encoder) else torch.tensor(U_encoder, dtype=torch.float32)
         self.U_dyn     = U_dyn.detach().clone()     if torch.is_tensor(U_dyn) else torch.tensor(U_dyn, dtype=torch.float32)
@@ -109,6 +126,7 @@ class TorchDLODataset(Dataset):
         self.encoder_scalar = encoder_scalar
         self.dyn_scalar     = dyn_scalar
         self.output_scalar  = output_scalar
+        self.decoder_scalar = decoder_scalar
 
     def __len__(self):
         return self.Y.shape[0]

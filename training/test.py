@@ -19,10 +19,12 @@ encoder = SimpleEncoder(**checkpoint["model_params"]["encoder_params"], device=d
 dynamics = GruDynamics(**checkpoint["model_params"]["dynamics_params"], device=device)
 decoder = SimpleDecoder(**checkpoint["model_params"]["decoder_params"], device=device)
 
-model = DLOModel(encoder, dynamics, decoder)
+model = DLOModel(encoder, dynamics, decoder, **checkpoint.get("model_kwargs", {}),
+                 enc_scaler=checkpoint.get("Enc_scaler"), dec_scaler=checkpoint.get("Dec_scaler"))
 model.to(device)
 
 model.load_state_dict(checkpoint["model_state"])
+model.eval()
 
 Dyn_scaler = checkpoint["Dyn_scaler"]
 Output_scaler = checkpoint["Output_scaler"]

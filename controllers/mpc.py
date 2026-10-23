@@ -22,7 +22,8 @@ encoder = SimpleEncoder(**checkpoint["model_params"]["encoder_params"], device=d
 dynamics = GruDynamics(**checkpoint["model_params"]["dynamics_params"], device=device)
 decoder = SimpleDecoder(**checkpoint["model_params"]["decoder_params"], device=device)
 
-model = DLOModel(encoder, dynamics, decoder)
+model = DLOModel(encoder, dynamics, decoder, **checkpoint.get("model_kwargs", {}),
+                 enc_scaler=checkpoint.get("Enc_scaler"), dec_scaler=checkpoint.get("Dec_scaler"))
 model.to(device)
 
 model.load_state_dict(checkpoint["model_state"])
@@ -44,7 +45,9 @@ def mpc_step(u_enc, u_pitch_yaw, goal, initial_actions, gd_iters=30, lr=0.01, al
     u_min = torch.tensor([-0.6, -0.6], device=actions.device)
     u_max = torch.tensor([ 0.6,  0.6], device=actions.device)
 
-    model.train()
+    # Solo el GRU en modo train (cuDNN lo exige para el backward); el dropout de encoder/decoder desactivado
+    model.eval()
+    model.dynamics.train()
     for p in model.parameters():
         p.requires_grad_(False)
 

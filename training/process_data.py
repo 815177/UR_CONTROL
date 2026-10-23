@@ -113,9 +113,11 @@ def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size
     train_trajs = slice_trajs(trajs, train_idxs)
     val_trajs = slice_trajs(trajs, val_idxs)
 
-    # encoder -> Normalizar tiambién????
+    # encoder (sin escalar: DLOModel aplica enc_scalar en el forward)
     enc_train = construct_encoder_inputs(train_trajs)
     enc_val = construct_encoder_inputs(val_trajs)
+    enc_scalar = TorchStandardScaler()
+    enc_scalar.fit(np.vstack(enc_train))
     U_enc_train = divide_into_rolling_windows_and_stack(enc_train, rollout_length)
     U_enc_val = divide_into_rolling_windows_and_stack(enc_val, rollout_length)
 
@@ -132,6 +134,8 @@ def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size
     # decoder
     dec_train = construct_decoder_inputs(train_trajs)
     dec_val = construct_decoder_inputs(val_trajs)
+    dec_scalar = TorchMinMaxScaler(feature_range=(-1, 1))   # sin escalar: DLOModel aplica dec_scalar
+    dec_scalar.fit(np.vstack(dec_train))
     U_dec_train = divide_into_rolling_windows_and_stack(dec_train, rollout_length)
     U_dec_val = divide_into_rolling_windows_and_stack(dec_val, rollout_length)
 
@@ -150,17 +154,19 @@ def construct_train_val_datasets_from_trajs(trajs, rollout_length: int, val_size
                           U_dyn=U_dyn_train,
                           U_decoder=U_dec_train,
                           Y=Y_train,
-                          encoder_scalar=None,
+                          encoder_scalar=enc_scalar,
                           dyn_scalar=dyn_scalar,
-                          output_scalar=obs_scalar)
+                          output_scalar=obs_scalar,
+                          decoder_scalar=dec_scalar)
 
     val_ds = TorchDLODataset(U_encoder=U_enc_val,
                         U_dyn=U_dyn_val,
                         U_decoder=U_dec_val,
                         Y=Y_val,
-                        encoder_scalar=None,
+                        encoder_scalar=enc_scalar,
                         dyn_scalar=dyn_scalar,
-                        output_scalar=obs_scalar)
+                        output_scalar=obs_scalar,
+                        decoder_scalar=dec_scalar)
 
     return train_ds, val_ds
 

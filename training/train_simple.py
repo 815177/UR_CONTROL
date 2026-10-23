@@ -7,6 +7,7 @@ from training.process_data import *
 import torch
 import matplotlib.pyplot as plt
 import os
+import copy
 from sklearn.metrics import mean_squared_error, r2_score
 
 class RolloutScheduler:
@@ -90,7 +91,7 @@ def evaluate_and_plot(model, train_ds, val_ds, batch_size=16, device='cuda', sav
     
     mse_train = mean_squared_error(Y_train_pred[:, :, 0:3].reshape(-1, 3), Y_train_true[:, :, 0:3].reshape(-1, 3))
     rmse_train = np.sqrt(mse_train)
-    r2_train = r2_score(Y_train_pred.reshape(-1, 3), Y_train_true.reshape(-1, 3))
+    r2_train = r2_score(Y_train_true.reshape(-1, 3), Y_train_pred.reshape(-1, 3))
 
     print("MSE TRAIN: ", mse_train)
     print("RMSE TRAIN: ", rmse_train)
@@ -98,7 +99,7 @@ def evaluate_and_plot(model, train_ds, val_ds, batch_size=16, device='cuda', sav
 
     mse_val = mean_squared_error(Y_val_pred[:, :, 0:3].reshape(-1, 3), Y_val_true[:, :, 0:3].reshape(-1, 3))
     rmse_val = np.sqrt(mse_val)
-    r2_val = r2_score(Y_val_pred.reshape(-1, 3), Y_val_true.reshape(-1, 3))
+    r2_val = r2_score(Y_val_true.reshape(-1, 3), Y_val_pred.reshape(-1, 3))
 
     print("MSE VAL: ", mse_val)
     print("RMSE VAL: ", rmse_val)
@@ -106,13 +107,14 @@ def evaluate_and_plot(model, train_ds, val_ds, batch_size=16, device='cuda', sav
 
     return Y_train_pred, Y_val_pred
 
-def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cuda"):
+def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cuda",
+                weight_decay=1e-4, patience=15):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     model.to(device) 
 
-    optimizer = optim.Adam(model.parameters(),  lr=0.0005)
+    optimizer = optim.AdamW(model.parameters(),  lr=0.0005, weight_decay=weight_decay)
     criterion = nn.L1Loss(reduction='none')              # nn.MSELoss() nn.L1Loss()
 
     # rollout scheduler como en el paper
@@ -127,7 +129,12 @@ def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cud
     #     "boundaries": [40, 80, 120, 160],
     #     "scales": [1, 1, 1, 1]
     # }
-    scheduler = RolloutScheduler(**scheduler_cfg, max_rollout=train_ds.Y.shape[1])
+    max_rollout = train_ds.Y.shape[1]
+    scheduler = RolloutScheduler(**scheduler_cfg, max_rollout=max_rollout)
+
+    # Early stopping sobre la val loss con horizonte completo (las de horizontes más
+    # cortos no son comparables), contando solo desde que el scheduler llega al máximo
+    best_val, best_state, best_epoch, epochs_no_improve = float("inf"), None, 0, 0
 
     for epoch in range(1, n_epochs+1):
         model.train()
@@ -158,6 +165,7 @@ def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cud
         # validación
         model.eval()
         val_loss = 0.0
+        val_loss_full = 0.0
         with torch.no_grad():
             for u_enc, U_dyn, U_dec, Y in val_loader:
                 u_enc, U_dyn, U_dec, Y = (
@@ -168,10 +176,26 @@ def train_model(model, train_ds, val_ds, n_epochs=25, batch_size=64, device="cud
                 #     Y_pred[:, :rollout_horizon], Y[:, :rollout_horizon]
                 # ).item() * u_enc.size(0)
                 val_loss += ((torch.mean(torch.abs(Y_pred[:, :rollout_horizon, :] - Y[:, :rollout_horizon, :]), dim=(1,2))).mean()).item() * u_enc.size(0) 
+                val_loss_full += torch.mean(torch.abs(Y_pred - Y)).item() * u_enc.size(0)
 
         val_loss /= len(val_loader.dataset)
+        val_loss_full /= len(val_loader.dataset)
         print(f"Epoch {epoch:03d} | rollout={rollout_horizon} | "
-              f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
+              f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, val_loss_full={val_loss_full:.6f}")
+
+        if rollout_horizon >= max_rollout:
+            if val_loss_full < best_val:
+                best_val, best_epoch, epochs_no_improve = val_loss_full, epoch, 0
+                best_state = copy.deepcopy(model.state_dict())
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"Early stopping en epoch {epoch}")
+                    break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"Mejor modelo: epoch {best_epoch} | val_loss_full={best_val:.6f}")
 
     return model
 
@@ -184,20 +208,32 @@ vec = list(range(24)) + list(range(37, 41)) + list(range(44, 50))
 # trajs = load_trajs_old(vec)
 trajs = load_trajs(vec)
 
-# Construir modelo -> corregir dimensiones según datos
-encoder = SimpleEncoder(input_dim=18, hidden_dims=[32, 32], output_dim=160, device=device)
-dynamics = GruDynamics(input_dim=2, hidden_dim=160, n_layers=1, device=device)
-decoder = SimpleDecoder(input_dim=162, hidden_dims=[32, 32], output_dim=3, device=device)
-model = DLOModel(encoder, dynamics, decoder, n_layers=1)
-
-torch.cuda.empty_cache()
-
 train_ds, val_ds = construct_train_val_datasets_from_trajs(
     trajs, rollout_length=40, val_size=0.2, seed=800
 )
 
+# Construir modelo
+# Más pequeño y más regularizado: con ~34 trayectorias reales el GRU de 160 memorizaba el training
+latent_dim = 64
+mlp_dropout = 0.15
+encoder_params = {"input_dim": 18, "hidden_dims": [32, 32], "output_dim": latent_dim}
+dynamics_params = {"input_dim": 2, "hidden_dim": latent_dim, "n_layers": 1}
+decoder_params = {"input_dim": latent_dim + 2, "hidden_dims": [32, 32], "output_dim": 3}
+model_kwargs = {"n_layers": 1, "bound_h0": True}
+
+encoder = SimpleEncoder(**encoder_params, dropout=mlp_dropout, device=device)
+dynamics = GruDynamics(**dynamics_params, device=device)
+decoder = SimpleDecoder(**decoder_params, dropout=mlp_dropout, device=device)
+model = DLOModel(encoder, dynamics, decoder, **model_kwargs,
+                 noise_std=0.05,                            # ruido en la entrada del encoder (escalada)
+                 enc_scaler=train_ds.encoder_scalar,
+                 dec_scaler=train_ds.decoder_scalar)
+
+torch.cuda.empty_cache()
+
 # Entrenamiento
-trained_model = train_model(model, train_ds, val_ds, n_epochs=90, batch_size=64, device=device)
+trained_model = train_model(model, train_ds, val_ds, n_epochs=200, batch_size=64, device=device,
+                            weight_decay=1e-4, patience=20)
 
 # Evaluación
 Y_train_pred, Y_val_pred = evaluate_and_plot(trained_model, train_ds, val_ds, batch_size=64, device=device)
@@ -205,24 +241,15 @@ Y_train_pred, Y_val_pred = evaluate_and_plot(trained_model, train_ds, val_ds, ba
 checkpoint = {
     "model_state": model.state_dict(), 
     "model_params": {
-        "encoder_params": {
-            "input_dim": 18,
-            "hidden_dims": [64, 64],
-            "output_dim": 160
-        },
-        "dynamics_params": {
-            "input_dim": 2,
-            "hidden_dim":160,
-            "n_layers": 1
-        },
-        "decoder_params": {
-            "input_dim": 162,
-            "hidden_dims": [64, 64],
-            "output_dim": 3
-        }
+        "encoder_params": encoder_params,
+        "dynamics_params": dynamics_params,
+        "decoder_params": decoder_params
     },
+    "model_kwargs": model_kwargs,
     "Dyn_scaler": train_ds.dyn_scalar,
-    "Output_scaler": train_ds.output_scalar
+    "Output_scaler": train_ds.output_scalar,
+    "Enc_scaler": train_ds.encoder_scalar,
+    "Dec_scaler": train_ds.decoder_scalar
 }
 
 torch.save(checkpoint, "./models/model_simple.pth")
